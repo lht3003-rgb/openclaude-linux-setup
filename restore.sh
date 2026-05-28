@@ -1,11 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # OpenClaude Config Restore Script for Linux Mint
-# Restores config, agents, projects, memory from Windows backup
-# Usage: bash restore.sh
+# Restores providers, agents, projects, memory, and model routing
+# from the Windows backup onto Linux Mint on the external SSD.
+# Usage: bash restore.sh [backup-dot-openclaude-path]
 # ============================================================
 
-set -e
+set -Eeuo pipefail
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -18,36 +19,106 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; }
 info() { echo -e "${CYAN}[INFO]${NC} $1"; }
 
+copy_dir_contents() {
+    local src="$1"
+    local dst="$2"
+    mkdir -p "$dst"
+    cp -a "$src"/. "$dst"/
+}
+
+json_get() {
+    local file="$1"
+    local expr="$2"
+    node -e "const fs=require('fs'); const p='$file'; if(fs.existsSync(p)){const j=JSON.parse(fs.readFileSync(p,'utf8')); const v=($expr); if(Array.isArray(v)) console.log(v.join(', ')); else if(v && typeof v==='object') console.log(Object.keys(v).join(', ')); else console.log(v || 'missing')}" 2>/dev/null || echo "missing"
+}
+
+json_validate() {
+    local file="$1"
+    node -e "JSON.parse(require('fs').readFileSync('$file', 'utf8'))" >/dev/null
+}
+
+find_backup_dir() {
+    if [ -n "${1:-}" ] && [ -d "$1" ]; then
+        echo "$1"
+        return 0
+    fi
+
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+    if [ -d "$script_dir/dot-openclaude" ]; then
+        echo "$script_dir/dot-openclaude"
+        return 0
+    fi
+
+    local mount_point
+    for mount_point in \
+        /media/"$USER"/*/openclaude-backup/dot-openclaude \
+        /media/*/openclaude-backup/dot-openclaude \
+        /mnt/openclaude-backup/dot-openclaude \
+        /e/openclaude-backup/dot-openclaude; do
+        if [ -d "$mount_point" ]; then
+            echo "$mount_point"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+print_backup_summary() {
+    local backup_dir="$1"
+
+    log "Backup contents:"
+    echo "    Agents:   $(find "$backup_dir/agents" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l) files"
+    echo "    Projects: $(find "$backup_dir/projects" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) dirs"
+    echo "    Memory:   $(find "$backup_dir/projects" -name '*.md' 2>/dev/null | wc -l) files"
+    echo "    Settings: $([ -f "$backup_dir/settings.json" ] && echo OK || echo missing)"
+    echo "    Gateway:  $([ -f "$backup_dir/gemini-gateway.mjs" ] && echo OK || echo missing)"
+
+    if [ -f "$backup_dir/settings.json" ] && json_validate "$backup_dir/settings.json"; then
+        echo "    Model:    $(json_get "$backup_dir/settings.json" "j.model")"
+        echo "    Routes:   $(json_get "$backup_dir/settings.json" "j.agentRouting")"
+        echo "    Models:   $(json_get "$backup_dir/settings.json" "j.agentModels")"
+    fi
+}
+
+fix_windows_paths_notice() {
+    local settings_file="$1"
+
+    if [ ! -f "$settings_file" ]; then
+        return 0
+    fi
+
+    if grep -Eq 'C:|C--Users-Admin|\\\\|/c/|/e/' "$settings_file"; then
+        warn "settings.json may contain Windows-specific paths. Review after restore if a provider/gateway fails."
+    fi
+}
+
 echo "============================================"
-echo "  OpenClaude Config Restore from Backup"
+echo "  OpenClaude Full Restore for Linux Mint"
 echo "============================================"
+echo ""
+echo "This restores the whole OpenClaude environment from Windows backup:"
+echo "  - providers and model routing"
+echo "  - custom agents"
+echo "  - project contexts and memory"
+echo "  - gateway/helper files"
+echo ""
+echo "The goal is to move the workload off the nearly-full Windows C: drive"
+echo "and run it from Linux Mint on the external SSD."
 echo ""
 
 # ------------------------------------------------------------
-# 1. Auto-detect backup location
+# 1. Locate backup
 # ------------------------------------------------------------
-BACKUP_DIR=""
-
-# Check common mount points on Linux Mint
-for mount_point in /media/$USER/*/openclaude-backup /media/*/openclaude-backup /mnt/openclaude-backup; do
-    if [ -d "$mount_point/dot-openclaude" ]; then
-        BACKUP_DIR="$mount_point/dot-openclaude"
-        break
-    fi
-done
-
-# Also check if running from the backup drive itself
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -d "$SCRIPT_DIR/dot-openclaude" ]; then
-    BACKUP_DIR="$SCRIPT_DIR/dot-openclaude"
-fi
+BACKUP_DIR="$(find_backup_dir "${1:-}" || true)"
 
 if [ -z "$BACKUP_DIR" ]; then
     err "Cannot find backup directory automatically."
     echo ""
-    echo "  Expected location: <USB_MOUNT>/openclaude-backup/dot-openclaude/"
-    echo ""
-    read -p "Enter backup path manually: " BACKUP_DIR
+    echo "Expected: <SSD_MOUNT>/openclaude-backup/dot-openclaude/"
+    read -r -p "Enter backup path manually: " BACKUP_DIR
     if [ ! -d "$BACKUP_DIR" ]; then
         err "Directory not found: $BACKUP_DIR"
         exit 1
@@ -61,131 +132,100 @@ echo ""
 # 2. Verify backup contents
 # ------------------------------------------------------------
 info "Verifying backup contents..."
-
 MISSING=()
 [ ! -d "$BACKUP_DIR/agents" ] && MISSING+=("agents/")
 [ ! -f "$BACKUP_DIR/settings.json" ] && MISSING+=("settings.json")
-[ ! -f "$BACKUP_DIR/.openclaude-profile.json" ] && MISSING+=(".openclaude-profile.json")
 [ ! -d "$BACKUP_DIR/projects" ] && MISSING+=("projects/")
 
-if [ ${#MISSING[@]} -gt 0 ]; then
-    warn "Some expected items missing from backup:"
+if [ "${#MISSING[@]}" -gt 0 ]; then
+    warn "Some expected items are missing:"
     for item in "${MISSING[@]}"; do
         echo "    - $item"
     done
     echo ""
-    read -p "Continue anyway? (y/n): " -n 1 -r
-    echo ""
-    [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+    read -r -p "Continue anyway? (y/n): " CONTINUE
+    [[ ! "$CONTINUE" =~ ^[Yy]$ ]] && exit 1
 fi
 
-log "Backup contents:"
-echo "    Agents:     $(ls "$BACKUP_DIR/agents/"*.md 2>/dev/null | wc -l) files"
-echo "    Projects:   $(ls -d "$BACKUP_DIR/projects/"*/ 2>/dev/null | wc -l) dirs"
-echo "    Memory:     $(find "$BACKUP_DIR/projects/" -name "*.md" 2>/dev/null | wc -l) memory files"
-echo "    Settings:   $([ -f "$BACKUP_DIR/settings.json" ] && echo 'OK' || echo 'missing')"
-echo "    Profile:    $([ -f "$BACKUP_DIR/.openclaude-profile.json" ] && echo 'OK' || echo 'missing')"
+if [ -f "$BACKUP_DIR/settings.json" ]; then
+    if json_validate "$BACKUP_DIR/settings.json"; then
+        log "Backup settings.json is valid"
+    else
+        warn "Backup settings.json is invalid JSON. It will be copied, but OpenClaude may ignore it."
+    fi
+fi
+
+print_backup_summary "$BACKUP_DIR"
 echo ""
 
 # ------------------------------------------------------------
-# 3. Backup current config (if exists)
+# 3. Backup current Linux config
 # ------------------------------------------------------------
 TARGET="$HOME/.openclaude"
-
 if [ -d "$TARGET" ]; then
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    BACKUP_CURRENT="$TARGET.backup.$TIMESTAMP"
-    warn "Existing config found at $TARGET"
-    info "Backing up current config to: $BACKUP_CURRENT"
-    mv "$TARGET" "$BACKUP_CURRENT"
-    log "Current config backed up"
-else
-    info "No existing config found, fresh install"
+    CURRENT_BACKUP="$TARGET.backup.$(date +%Y%m%d_%H%M%S)"
+    warn "Existing Linux config found at $TARGET"
+    cp -a "$TARGET" "$CURRENT_BACKUP"
+    log "Current Linux config copied to $CURRENT_BACKUP"
 fi
-echo ""
 
 # ------------------------------------------------------------
-# 4. Restore config
+# 4. Restore full config
 # ------------------------------------------------------------
-info "Restoring config from backup..."
-cp -r "$BACKUP_DIR" "$TARGET"
+info "Restoring full OpenClaude config..."
+mkdir -p "$TARGET"
+copy_dir_contents "$BACKUP_DIR" "$TARGET"
 log "Config restored to $TARGET"
 
 # ------------------------------------------------------------
-# 5. Fix permissions
+# 5. Linux permissions and compatibility notices
 # ------------------------------------------------------------
-info "Setting permissions..."
-chmod 600 "$TARGET"/Claude_Code-credentials.secure.dpapi 2>/dev/null || true
-chmod 700 "$TARGET"
+info "Setting Linux permissions..."
+chmod 700 "$TARGET" 2>/dev/null || true
+chmod 600 "$TARGET"/*.json "$TARGET"/*.secure* 2>/dev/null || true
 
-# ------------------------------------------------------------
-# 6. Update settings for Linux environment
-# ------------------------------------------------------------
-info "Checking settings..."
-
-# Update settings.json to work with Ollama (if installed)
-if command -v ollama &> /dev/null; then
-    OLLAMA_MODELS=$(ollama list 2>/dev/null | tail -n +2 | head -1 | awk '{print $1}')
-    if [ -n "$OLLAMA_MODELS" ]; then
-        log "Ollama detected with model: $OLLAMA_MODELS"
-        echo ""
-        echo "  Current settings.json model: $(cat "$TARGET/settings.json" 2>/dev/null | grep -o '"model"[^,]*' | head -1)"
-        echo "  Available Ollama model:      $OLLAMA_MODELS"
-        echo ""
-        read -p "Switch to Ollama local model? (y/n): " -n 1 -r
-        echo ""
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            # Update profile for Ollama
-            cat > "$TARGET/.openclaude-profile.json" << EOF
-{
-  "profile": "ollama-local",
-  "env": {
-    "OLLAMA_HOST": "http://localhost:11434",
-    "OLLAMA_MODEL": "$OLLAMA_MODELS"
-  },
-  "createdAt": "$(date -Iseconds)"
-}
-EOF
-            log "Profile switched to Ollama ($OLLAMA_MODELS)"
-        else
-            info "Keeping original profile (opengateway)"
-        fi
-    else
-        warn "Ollama installed but no models pulled yet"
-        echo "    Run: ollama pull qwen2.5-coder:7b"
-    fi
-else
-    warn "Ollama not installed"
-    echo "    Run setup.sh first, or install manually: curl -fsSL https://ollama.com/install.sh | sh"
+if [ -f "$TARGET/Claude_Code-credentials.secure.dpapi" ]; then
+    warn "Windows DPAPI credentials were restored but cannot be used on Linux."
+    echo "    API-key providers in settings.json should still work. OAuth providers may need login again."
 fi
 
+if [ -f "$TARGET/gemini-gateway.mjs" ]; then
+    log "Gemini gateway file restored"
+fi
+
+fix_windows_paths_notice "$TARGET/settings.json"
+
 # ------------------------------------------------------------
-# 7. Verify restore
+# 6. Verify restore
 # ------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "  Restore Complete!"
+echo "  Restore Complete"
 echo "============================================"
 echo ""
 
 log "Config directory: $TARGET"
-log "Agents restored:"
-for agent in "$TARGET/agents/"*.md; do
+if [ -f "$TARGET/settings.json" ]; then
+    log "Settings model: $(json_get "$TARGET/settings.json" "j.model")"
+    info "Agent model entries: $(json_get "$TARGET/settings.json" "j.agentModels")"
+    info "Agent routing entries: $(json_get "$TARGET/settings.json" "j.agentRouting")"
+fi
+
+info "Agents restored:"
+for agent in "$TARGET"/agents/*.md; do
     [ -f "$agent" ] && echo "    - $(basename "$agent")"
 done
 
-echo ""
-log "Projects restored:"
-for proj in "$TARGET/projects/"*/; do
-    [ -d "$proj" ] && echo "    - $(basename "$proj")"
+info "Projects restored:"
+for project in "$TARGET"/projects/*/; do
+    [ -d "$project" ] && echo "    - $(basename "$project")"
 done
 
 echo ""
 echo "Next steps:"
-echo "  1. Open new terminal:  source ~/.bashrc"
-echo "  2. Run OpenClaude:     openclaude"
-echo "  3. Check config:       cat ~/.openclaude/settings.json"
-echo ""
-echo "To switch back to opengateway (mimo model):"
-echo "  Edit ~/.openclaude/.openclaude-profile.json"
+echo "  1. Open a new terminal, or run: source ~/.bashrc"
+echo "  2. Run OpenClaude: openclaude"
+echo "  3. Use /provider to verify restored providers/models"
+echo "  4. If OAuth providers fail, login again on Linux."
+echo "  5. Keep large local AI models on the Linux SSD, not Windows C:."
 echo ""

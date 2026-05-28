@@ -1,223 +1,255 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
-# OpenClaude + Ollama Setup Script for Linux Mint
-# Author: lht3003-rgb
-# Usage: bash setup.sh
+# OpenClaude Linux Mint Migration Setup
+# Installs OpenClaude prerequisites and restores the full Windows
+# OpenClaude environment from the external SSD backup.
+# Usage: bash setup.sh [backup-dot-openclaude-path]
 # ============================================================
 
-set -e
+set -Eeuo pipefail
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 log() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; }
+info() { echo -e "${CYAN}[INFO]${NC} $1"; }
+
+select_shell_rc() {
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        echo "$HOME/.zshrc"
+    else
+        echo "$HOME/.bashrc"
+    fi
+}
+
+append_if_missing() {
+    local file="$1"
+    local marker="$2"
+    local content="$3"
+
+    touch "$file"
+    if ! grep -Fq "$marker" "$file"; then
+        printf '\n%s\n' "$content" >> "$file"
+        log "Added environment block to $file"
+    else
+        info "Environment block already exists in $file"
+    fi
+}
+
+json_validate() {
+    local file="$1"
+    node -e "JSON.parse(require('fs').readFileSync('$file', 'utf8'))" >/dev/null
+}
+
+find_backup_dir() {
+    if [ -n "${1:-}" ] && [ -d "$1" ]; then
+        echo "$1"
+        return 0
+    fi
+
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+    if [ -d "$script_dir/dot-openclaude" ]; then
+        echo "$script_dir/dot-openclaude"
+        return 0
+    fi
+
+    local mount_point
+    for mount_point in \
+        /media/"$USER"/*/openclaude-backup/dot-openclaude \
+        /media/*/openclaude-backup/dot-openclaude \
+        /mnt/openclaude-backup/dot-openclaude \
+        /e/openclaude-backup/dot-openclaude; do
+        if [ -d "$mount_point" ]; then
+            echo "$mount_point"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+restore_openclaude_backup() {
+    local backup_dir="$1"
+    local target="$HOME/.openclaude"
+
+    if [ ! -d "$backup_dir" ]; then
+        err "Backup directory not found: $backup_dir"
+        return 1
+    fi
+
+    info "Restoring full OpenClaude environment from: $backup_dir"
+
+    if [ -d "$target" ]; then
+        local current_backup="$target.backup.$(date +%Y%m%d_%H%M%S)"
+        cp -a "$target" "$current_backup"
+        warn "Existing $target copied to $current_backup"
+    fi
+
+    mkdir -p "$target"
+    cp -a "$backup_dir"/. "$target"/
+    chmod 700 "$target" 2>/dev/null || true
+    chmod 600 "$target"/*.json "$target"/*.secure* 2>/dev/null || true
+
+    if [ -f "$target/settings.json" ]; then
+        if json_validate "$target/settings.json"; then
+            log "Restored settings.json is valid"
+        else
+            warn "Restored settings.json is not valid JSON; OpenClaude may ignore it"
+        fi
+    fi
+
+    if [ -f "$target/Claude_Code-credentials.secure.dpapi" ]; then
+        warn "Windows DPAPI credential file was restored but cannot be used on Linux."
+        echo "    Providers stored as API keys/settings should still work. OAuth credentials may need login again."
+    fi
+
+    log "OpenClaude config restored to $target"
+}
+
+install_ollama_optional() {
+    echo ""
+    read -r -p "Install Ollama/local model support too? (y/n): " INSTALL_OLLAMA
+    if [[ ! "$INSTALL_OLLAMA" =~ ^[Yy]$ ]]; then
+        info "Skipped Ollama. Your restored providers/models remain unchanged."
+        return 0
+    fi
+
+    if command -v ollama >/dev/null 2>&1; then
+        info "Ollama already installed: $(ollama --version 2>/dev/null || echo installed)"
+    else
+        curl -fsSL https://ollama.com/install.sh | sh
+        log "Ollama installed"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl enable ollama >/dev/null 2>&1 || true
+        sudo systemctl start ollama >/dev/null 2>&1 || true
+    fi
+
+    if ! curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then
+        nohup ollama serve >/tmp/ollama-openclaude.log 2>&1 &
+        sleep 3
+    fi
+
+    local default_model="qwen2.5-coder:7b"
+    read -r -p "Pull optional local model $default_model? (y/n): " PULL_MODEL
+    if [[ "$PULL_MODEL" =~ ^[Yy]$ ]]; then
+        ollama pull "$default_model"
+        log "$default_model pulled"
+        warn "OpenClaude settings were not overwritten. Use /provider or edit settings.json if you want Ollama as default."
+    fi
+}
 
 echo "============================================"
-echo "  OpenClaude + Ollama Full Setup for Linux"
+echo "  OpenClaude Linux Mint Migration Setup"
 echo "============================================"
+echo ""
+echo "Goal: restore your providers, agents, project memory, and model routing"
+echo "from the Windows backup onto Linux Mint running on the external SSD."
 echo ""
 
 # ------------------------------------------------------------
-# 1. System Update
+# 1. System packages
 # ------------------------------------------------------------
-log "Updating system packages..."
-sudo apt update && sudo apt upgrade -y
+log "Updating apt package index..."
+sudo apt update
 
-# ------------------------------------------------------------
-# 2. Install dependencies
-# ------------------------------------------------------------
 log "Installing dependencies..."
-sudo apt install -y curl wget git build-essential unzip
+sudo apt install -y curl wget git build-essential unzip ca-certificates jq
 
 # ------------------------------------------------------------
-# 3. Install Node.js (LTS via nvm)
+# 2. Node.js LTS via nvm
 # ------------------------------------------------------------
-log "Installing Node.js via nvm..."
-if [ ! -d "$HOME/.nvm" ]; then
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-    export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+log "Installing Node.js LTS via nvm..."
+export NVM_DIR="$HOME/.nvm"
+if [ ! -d "$NVM_DIR" ]; then
+    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 else
-    export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-    warn "nvm already installed"
+    info "nvm already installed"
+fi
+
+# shellcheck source=/dev/null
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+if ! command -v nvm >/dev/null 2>&1; then
+    err "nvm is not available after installation. Open a new terminal and rerun this script."
+    exit 1
 fi
 
 nvm install --lts
 nvm use --lts
-log "Node.js $(node --version) installed"
-log "npm $(npm --version) installed"
+log "Node.js $(node --version)"
+log "npm $(npm --version)"
 
 # ------------------------------------------------------------
-# 4. Install Ollama
-# ------------------------------------------------------------
-log "Installing Ollama..."
-if command -v ollama &> /dev/null; then
-    warn "Ollama already installed: $(ollama --version)"
-else
-    curl -fsSL https://ollama.com/install.sh | sh
-    log "Ollama installed: $(ollama --version)"
-fi
-
-# Start Ollama service
-log "Starting Ollama service..."
-sudo systemctl enable ollama 2>/dev/null || true
-sudo systemctl start ollama 2>/dev/null || ollama serve &>/dev/null &
-sleep 3
-
-# ------------------------------------------------------------
-# 5. Pull default models
-# ------------------------------------------------------------
-log "Pulling default models..."
-echo "  Models to pull:"
-echo "    - qwen2.5-coder:7b  (coding, ~4.7GB)"
-echo ""
-
-read -p "Pull models now? (y/n): " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    ollama pull qwen2.5-coder:7b
-    log "qwen2.5-coder:7b pulled"
-
-    read -p "Pull more models? (y/n): " -n 1 -r
-    echo ""
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "Available popular models:"
-        echo "  ollama pull llama3.1:8b        # General purpose"
-        echo "  ollama pull deepseek-r1:8b     # Reasoning"
-        echo "  ollama pull gemma3:4b          # Vision"
-        echo "  ollama pull codellama:7b       # Code"
-        echo "  ollama pull mistral:7b         # Fast"
-        echo ""
-        read -p "Enter model name to pull (or 'skip'): " MODEL
-        if [ "$MODEL" != "skip" ] && [ -n "$MODEL" ]; then
-            ollama pull "$MODEL"
-            log "$MODEL pulled"
-        fi
-    fi
-else
-    warn "Skipped model pulling"
-fi
-
-# ------------------------------------------------------------
-# 6. Install OpenClaude CLI
+# 3. Install OpenClaude CLI
 # ------------------------------------------------------------
 log "Installing OpenClaude CLI..."
 npm install -g @gitlawb/openclaude
-log "OpenClaude installed: $(openclaude --version 2>/dev/null || echo 'installed')"
+log "OpenClaude: $(openclaude --version 2>/dev/null || echo 'installed')"
 
 # ------------------------------------------------------------
-# 7. Clone OpenClaude source (for Ollama integration updates)
+# 4. Restore full OpenClaude backup
 # ------------------------------------------------------------
-log "Cloning OpenClaude source..."
-OPENCLAUDE_DIR="$HOME/openclaude"
-if [ ! -d "$OPENCLAUDE_DIR" ]; then
-    git clone https://github.com/Gitlawb/openclaude.git "$OPENCLAUDE_DIR"
-    log "Source cloned to $OPENCLAUDE_DIR"
+BACKUP_DIR="$(find_backup_dir "${1:-}" || true)"
+if [ -n "$BACKUP_DIR" ]; then
+    restore_openclaude_backup "$BACKUP_DIR"
 else
-    warn "Source already exists at $OPENCLAUDE_DIR"
-    cd "$OPENCLAUDE_DIR" && git pull
-fi
-
-# Build from source
-cd "$OPENCLAUDE_DIR"
-bun install 2>/dev/null || npm install
-log "Dependencies installed"
-
-# ------------------------------------------------------------
-# 8. Setup OpenClaude config
-# ------------------------------------------------------------
-log "Setting up OpenClaude config..."
-OPENCLAUDE_CONFIG="$HOME/.openclaude.json"
-
-if [ ! -f "$OPENCLAUDE_CONFIG" ]; then
-    cat > "$OPENCLAUDE_CONFIG" << 'EOF'
-{
-  "providerProfiles": [
-    {
-      "id": "ollama-local",
-      "name": "Ollama Local",
-      "provider": "ollama",
-      "baseUrl": "http://localhost:11434/v1",
-      "model": "qwen2.5-coder:7b",
-      "apiKey": "ollama"
-    }
-  ],
-  "activeProviderProfileId": "ollama-local"
-}
-EOF
-    log "Config created at $OPENCLAUDE_CONFIG"
-else
-    warn "Config already exists, skipping"
+    warn "No OpenClaude backup found automatically."
+    echo "Expected path examples:"
+    echo "  /media/\$USER/<drive>/openclaude-backup/dot-openclaude"
+    echo "  /mnt/openclaude-backup/dot-openclaude"
+    read -r -p "Enter backup path manually, or leave empty to skip restore: " MANUAL_BACKUP
+    if [ -n "$MANUAL_BACKUP" ]; then
+        restore_openclaude_backup "$MANUAL_BACKUP"
+    else
+        warn "Skipped restore. OpenClaude will start with fresh config until you run restore.sh."
+    fi
 fi
 
 # ------------------------------------------------------------
-# 9. Create OpenClaude settings directory
+# 5. Shell environment on external Linux install
 # ------------------------------------------------------------
-log "Creating OpenClaude settings..."
-OPENCLAUDE_DIR_CONFIG="$HOME/.openclaude"
-mkdir -p "$OPENCLAUDE_DIR_CONFIG"
-
-if [ ! -f "$OPENCLAUDE_DIR_CONFIG/settings.json" ]; then
-    cat > "$OPENCLAUDE_DIR_CONFIG/settings.json" << 'EOF'
-{
-  "model": "qwen2.5-coder:7b",
-  "effort": "high"
-}
-EOF
-    log "Settings created"
-fi
+SHELL_RC="$(select_shell_rc)"
+NODE_BIN_DIR="$(dirname "$(command -v node)")"
+OPENCLAUDE_ENV_BLOCK="# OpenClaude Linux Mint migration\nexport PATH=\"$NODE_BIN_DIR:\$PATH\"\nexport OLLAMA_HOST=\"http://localhost:11434\"\nexport OLLAMA_MODELS=\"\$HOME/.ollama/models\""
+append_if_missing "$SHELL_RC" "# OpenClaude Linux Mint migration" "$OPENCLAUDE_ENV_BLOCK"
 
 # ------------------------------------------------------------
-# 10. Setup environment variables
+# 6. Optional local model support
 # ------------------------------------------------------------
-log "Setting up environment variables..."
-SHELL_RC="$HOME/.bashrc"
-[ -n "$ZSH_VERSION" ] && SHELL_RC="$HOME/.zshrc"
-
-if ! grep -q "OLLAMA_HOST" "$SHELL_RC" 2>/dev/null; then
-    cat >> "$SHELL_RC" << 'EOF'
-
-# OpenClaude + Ollama
-export OLLAMA_HOST="0.0.0.0:11434"
-export OLLAMA_MODELS="$HOME/.ollama/models"
-export PATH="$HOME/.nvm/versions/node/$(node --version)/bin:$PATH"
-EOF
-    log "Environment variables added to $SHELL_RC"
-fi
+install_ollama_optional
 
 # ------------------------------------------------------------
-# 11. Verify installation
+# 7. Summary
 # ------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "  Installation Complete!"
+echo "  Migration Setup Complete"
 echo "============================================"
 echo ""
-
 log "Node.js: $(node --version)"
 log "npm: $(npm --version)"
-log "Ollama: $(ollama --version 2>/dev/null || echo 'check with: ollama --version')"
 log "OpenClaude: $(openclaude --version 2>/dev/null || echo 'check with: openclaude --version')"
 
-echo ""
-echo "Installed Ollama models:"
-ollama list 2>/dev/null || echo "  (start ollama first)"
+if [ -d "$HOME/.openclaude" ]; then
+    log "OpenClaude config: $HOME/.openclaude"
+    echo "    Agents:   $(find "$HOME/.openclaude/agents" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)"
+    echo "    Projects: $(find "$HOME/.openclaude/projects" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    echo "    Memory:   $(find "$HOME/.openclaude/projects" -name '*.md' 2>/dev/null | wc -l) files"
+fi
 
 echo ""
-echo "Quick start:"
-echo "  1. Open new terminal (or run: source $SHELL_RC)"
-echo "  2. Run: openclaude"
-echo "  3. Or chat with Ollama: ollama run qwen2.5-coder:7b"
-echo ""
-echo "To pull more models:"
-echo "  ollama pull <model-name>"
-echo "  Example: ollama pull llama3.1:8b"
-echo ""
-echo "Config file: $OPENCLAUDE_CONFIG"
-echo "Settings dir: $OPENCLAUDE_DIR_CONFIG"
+echo "Next steps:"
+echo "  1. Open a new terminal, or run: source $SHELL_RC"
+echo "  2. Start OpenClaude: openclaude"
+echo "  3. Use /provider to verify restored providers/models"
+echo "  4. If OAuth providers fail, login again on Linux; API-key providers should remain in settings."
 echo ""
